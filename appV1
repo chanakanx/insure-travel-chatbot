@@ -1,0 +1,194 @@
+import streamlit as st
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.callbacks import get_openai_callback
+import time
+import logging
+from dotenv import load_dotenv
+
+# =====================
+# Setup
+# =====================
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+st.set_page_config(
+    page_title="SubaCar Bot",
+    page_icon="🚗",
+    layout="centered"
+)
+
+st.title("SubaCar Bot – รถเช่าราคาดีที่สุดในไทย")
+st.caption("รถไฟฟ้า | ไฮบริด | SUV | Alphard | ถามมาเลย เดี๋ยวหารถให้")
+
+# =====================
+# Session State
+# =====================
+if "total_tokens" not in st.session_state:
+    st.session_state.total_tokens = 0
+    st.session_state.total_cost = 0.0
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# =====================
+# Sidebar
+# =====================
+with st.sidebar:
+    st.header("สถิติการใช้ OpenAI (สะสม)")
+    st.write(f"Total Tokens: {st.session_state.total_tokens:,}")
+    st.write(f"ค่าใช้จ่ายประมาณ: ${st.session_state.total_cost:.6f}")
+
+    if st.button("ล้างประวัติการสนทนา"):
+        st.session_state.chat_history = []
+        st.success("ล้างประวัติเรียบร้อยแล้วค่ะ")
+
+# =====================
+# Load RAG Chain
+# =====================
+@st.cache_resource
+def load_rag_chain():
+
+    embedding = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3"
+    )
+
+    vectorstore = Chroma(
+        persist_directory="chroma_db",
+        embedding_function=embedding
+    )
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": 6}
+    )
+
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.0
+    )
+
+    template = """
+คุณคือพนักงาน SubaCar ที่น่ารัก เป็นกันเอง และเชี่ยวชาญด้านรถเช่า
+ตอบภาษาไทยเท่านั้น
+
+ใช้ข้อมูลจากฐานข้อมูลด้านล่างนี้เท่านั้น
+ห้ามแต่งข้อมูลเพิ่ม ห้ามอนุมาน ห้ามคำนวณราคาเองเด็ดขาด
+
+ถ้าไม่มีข้อมูลที่เกี่ยวข้องใน context ให้ตอบว่า
+"ขอโทษค่ะ ข้อมูลนี้ยังไม่มีในระบบค่ะ"
+
+ข้อมูลรถจากฐานข้อมูลจริง:
+{context}
+
+ประวัติการสนทนาก่อนหน้า:
+{chat_history}
+
+คำถามลูกค้า (ข้อความล่าสุด):
+{question}
+
+แนวทางการตอบ:
+- ตอบสั้น ๆ เป็นกันเอง ใช้ bullet ไม่เกิน 5 ข้อ
+- เรียงรถจากราคาถูกไปแพง
+- บอกราคาชัดเจนตามระยะเช่าที่มีใน context เท่านั้น
+- บอกนโยบายยกเลิกทุกครั้ง
+- ถ้าลูกค้าเคยให้ข้อมูลแล้ว (เช่น จำนวนวัน ประเภทรถ) ห้ามถามซ้ำ
+
+หลังคำตอบหลัก:
+- เพิ่มข้อความปิดท้าย 1–2 ประโยค เพื่อถามข้อมูลที่ยังจำเป็นเท่านั้น
+- ห้ามขายตรง ห้ามใช้คำโปรโมชัน
+
+จบคำตอบทั้งหมดด้วยลิงก์นี้เสมอ:
+https://www.subacar.co.th/package
+
+ตอบเลย:
+"""
+
+    prompt = PromptTemplate.from_template(template)
+
+    chain = (
+        {
+            "context": (
+                RunnableLambda(lambda x: x["question"])
+                | retriever
+                | RunnableLambda(lambda docs: "\n\n".join(d.page_content for d in docs))
+            ),
+            "question": RunnableLambda(lambda x: x["question"]),
+            "chat_history": RunnableLambda(lambda x: x["chat_history"]),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    return chain
+
+
+with st.spinner("กำลังโหลดฐานข้อมูลรถ..."):
+    chain = load_rag_chain()
+
+st.success("พร้อมแล้ว 😊")
+
+# =====================
+# Chat UI
+# =====================
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+if user_input := st.chat_input("อยากเช่ารถแบบไหนคะ?"):
+    # แสดงข้อความ user
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # บันทึก user message
+    st.session_state.chat_history.append({
+        "role": "user",
+        "content": user_input
+    })
+
+    with st.chat_message("assistant"):
+        with st.spinner("กำลังหารถให้..."):
+            start_time = time.time()
+            try:
+                with get_openai_callback() as cb:
+                    history_text = "\n".join(
+                        f"{m['role']}: {m['content']}"
+                        for m in st.session_state.chat_history[-6:]
+                    )
+                    response = chain.invoke({
+                        "question": user_input,
+                        "chat_history": history_text
+                    })
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+
+                # บันทึก assistant message
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": response
+                })
+
+                # Update usage stats
+                st.session_state.total_tokens += cb.total_tokens
+                st.session_state.total_cost += cb.total_cost
+
+                logger.info(
+                    f"Success | {elapsed_time:.2f}s | Tokens: {cb.total_tokens} | Cost: ${cb.total_cost:.6f}"
+                )
+
+                st.markdown(response)
+                st.caption(f"⏱️ ใช้เวลาตอบ {elapsed_time:.2f} วินาที")
+
+            except Exception as e:
+                logger.error(str(e))
+                st.error("ขอโทษค่ะ เกิดข้อผิดพลาด ลองถามใหม่อีกครั้งนะคะ")
