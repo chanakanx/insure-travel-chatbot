@@ -1,28 +1,29 @@
-# Virtual environments
+# Virtual environment
 venv/
 env/
 .venv/
-virtualenv/
 
-# Python cache
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.Python
+pip-delete-this-directory.txt
 
 # Streamlit
 .streamlit/
 secrets.toml
 
-# Chroma DB (ไม่ควร push เพราะใหญ่และเฉพาะเครื่อง)
+# Chroma DB (ถ้าไม่จำเป็นต้องแชร์)
 chroma_db/
 
-# Environment files
+# Environment
 .env
-.env.local
 
-# macOS
+# OS
 .DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
