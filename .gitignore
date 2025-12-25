@@ -1,20 +1,25 @@
-# Virtual environment
+# Virtual environments
 venv/
 env/
 .venv/
+virtualenv/
 
 # Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
 # Streamlit
 .streamlit/
+secrets.toml
 
-# Chroma database (ไม่ควร push ขึ้น GitHub เพราะใหญ่และเฉพาะเครื่อง)
+# Chroma DB (ไม่ควร push เพราะใหญ่และเฉพาะเครื่อง)
 chroma_db/
 
-# Environment variables
+# Environment files
 .env
+.env.local
 
 # macOS
 .DS_Store
