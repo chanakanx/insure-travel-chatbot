@@ -1,3 +1,4 @@
+# app.py (เวอร์ชันแก้ไขล่าสุด - เพิ่ม abuse detection & escalation)
 import streamlit as st
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -8,8 +9,10 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.callbacks import get_openai_callback
 import time
 import logging
+import json
+import re
+from pathlib import Path
 from dotenv import load_dotenv
-import re  # เพิ่มเข้ามาเพื่อช่วยตรวจ pattern
 
 # =====================
 # Setup
@@ -23,10 +26,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================
-# Abuse Detection (เพิ่มใหม่)
+# Abuse Detection
 # =====================
-import re
-
 def classify_abuse_level(message: str) -> str:
     """
     ตรวจจับระดับความไม่เหมาะสมของข้อความผู้ใช้
@@ -40,11 +41,10 @@ def classify_abuse_level(message: str) -> str:
     
     # === ดักกรณีคำถามที่มี "บ้าง" ก่อนเลย (ส่วนใหญ่เป็นคำถามสุภาพ) ===
     if 'บ้าง' in message_lower:
-        # ยกเว้นเฉพาะกรณีที่มีคำหยาบรุนแรงนำหน้าชัดเจน เช่น "รถเหี้ยบ้างไหม", "ไอ้ควายบ้าง"
+        # ยกเว้นเฉพาะกรณีที่มีคำหยาบรุนแรงนำหน้าชัดเจน
         if re.search(r'(เหี้ย|ควาย|สัส|เย็ด|มึง|กู|แม่ง|ไอ้สัตว์|อีสัตว์|ชิบหาย)', message_lower):
             return "MEDIUM"
         else:
-            # เช่น "มีรถบ้างไหมครับ", "มีโปรอะไรบ้างคะ", "มีสาขาแถวนี้บ้างไหม"
             return "NONE"
     
     # === HIGH: คุกคามหรือใส่ร้ายบริษัท ===
@@ -52,17 +52,16 @@ def classify_abuse_level(message: str) -> str:
     slander_words = ['โกง', 'หลอก', 'ตุ๋น', 'ฉ้อโกง', 'scam', 'fraud', 'หลอกลวง', 'โจร']
     has_threat = any(word in message_lower for word in threat_words)
     has_slander = any(word in message_lower for word in slander_words)
-    has_company = any(k in message_lower for k in ['subacar', 'ซุบะคาร์', 'suba car', 'บริษัท', 'พวกมึง', 'พวกนี้', 'suba'])
+    has_company = any(k in message_lower for k in ['in sure', 'insure', 'อินชัว', 'บริษัท', 'พวกมึง', 'พวกนี้', 'indara', 'อินทาระ'])
     
     if has_threat or (has_slander and has_company):
         return "HIGH"
     
-    # === MEDIUM: คำหยาบหรือด่าชัดเจน (ลบ "บ้า" ออกแล้ว) ===
+    # === MEDIUM: คำหยาบหรือด่าชัดเจน ===
     vulgar_words = [
         'เหี้ย', 'ไอ้เหี้ย', 'ควาย', 'สัส', 'เย็ด', 'มึง', 'กู', 'แม่ง', 'ชิบหาย',
         'ไอ้สัตว์', 'อีสัตว์', 'อีดอก', 'ส้นตีน', 'หน้าตัวเมีย', 'เหี้ยเอ้ย',
         'ไอ้', 'ไอ', 'เวร', 'สัตว์', 'เพี้ยน', 'หน้าตัว'
-        # ไม่มี "บ้า" อีกต่อไป
     ]
     strong_bully_words = [
         'โง่', 'ปัญญาอ่อน', 'งี่เง่า', 'หน้าเงิน', 'เลว', 'ห่วยแตก', 'ขี้ข้า'
@@ -76,20 +75,19 @@ def classify_abuse_level(message: str) -> str:
     
     # === LOW: น้ำเสียงไม่สุภาพเล็กน้อย ===
     mild_negative_words = ['ห่วย', 'แย่', 'ขี้เกียจ', 'ไร้สาระ', 'ด้อย', 'เสียดาย']
-    excessive_exclamation = re.search(r'[!?]{6,}', message)  # 6 ตัวขึ้นไป
+    excessive_exclamation = re.search(r'[!?]{6,}', message)
     rude_ending = re.search(r'\bวะ\b|\bเว้ย\b|\bเฮ้ย\b', message_lower)
     
     if any(word in message_lower for word in mild_negative_words) or excessive_exclamation or rude_ending:
         return "LOW"
     
-    # ถ้าไม่เข้าหมวดไหนเลย → สุภาพ
     return "NONE"
 
 # =====================
-# Escalation Prompt (เพิ่มใหม่)
+# Escalation Chain
 # =====================
 fallback_escalation_template = """
-คุณคือระบบป้องกันความสุภาพของ Chatbot SUB A CAR
+คุณคือระบบป้องกันความสุภาพของ Chatbot
 หน้าที่หลักคือตอบกลับเมื่อผู้ใช้ใช้ถ้อยคำไม่เหมาะสมเท่านั้น
 
 ใช้ Template นี้เมื่อ classify_abuse_level ตรวจพบระดับ LOW / MEDIUM / HIGH เท่านั้น
@@ -118,20 +116,20 @@ fallback_escalation_template = """
 ตัวอย่าง:
 [ตอบข้อมูลตามคำถามปกติก่อน]
 ขอความร่วมมือใช้ถ้อยคำที่สุภาพในการสนทนานะคะ 😊
-หากมีคำถามเกี่ยวกับบริการรถเช่าของ SUB A CAR สามารถสอบถามใหม่ได้เลยค่ะ 🚗
+หากมีคำถามเกี่ยวกับประกันเดินทาง สามารถสอบถามใหม่ได้เลยค่ะ
 
 ถ้า {level} = MEDIUM
 → ตั้งขอบเขตชัดเจน ห้ามตอบเนื้อหาคำถาม
-ต้องตอบข้อความนี้เท่านั้น (ปรับได้เล็กน้อย แต่โครงสร้างเดียวกัน):
+ต้องตอบข้อความนี้เท่านั้น:
 ขออภัยนะคะ ระบบไม่สามารถตอบข้อความที่มีถ้อยคำไม่เหมาะสมได้ค่ะ
 ขอความร่วมมือใช้ภาษาที่สุภาพในการสนทนานะคะ
-หากมีคำถามเกี่ยวกับบริการรถเช่าของ SUB A CAR สามารถสอบถามใหม่ได้เลยค่ะ 🚗
+หากมีคำถามเกี่ยวกับประกันเดินทาง สามารถสอบถามใหม่ได้เลยค่ะ
 
 ถ้า {level} = HIGH
 → ยุติการสนทนาทันที ห้ามชวนคุยต่อ
-ต้องตอบข้อความนี้เท่านั้น (ปรับได้เล็กน้อย แต่โครงสร้างเดียวกัน):
+ต้องตอบข้อความนี้เท่านั้น:
 ขออภัยค่ะ ระบบไม่สามารถดำเนินการสนทนาที่มีถ้อยคำไม่เหมาะสมต่อได้ค่ะ
-หากต้องการความช่วยเหลือ สามารถติดต่อเจ้าหน้าที่ผ่าน Line @subacar หรือ Call Center โดยตรงได้นะคะ
+หากต้องการความช่วยเหลือ สามารถติดต่อเจ้าหน้าที่ผ่านช่องทางที่ระบุบนเว็บไซต์ได้เลยนะคะ
 
 ────────────────────────
 ข้อห้ามเด็ดขาด:
@@ -143,126 +141,107 @@ fallback_escalation_template = """
 """
 
 # =====================
-# Original functions (ไม่เปลี่ยนแปลง)
-# =====================
-def detect_answer_source(response_text: str, context_text: str) -> str:
-    """
-    ตรวจสอบแบบ heuristic ว่าคำตอบอ้างอิงจาก context หรือไม่
-    """
-    if not context_text or not response_text:
-        return "unknown"
-
-    # ตัด context ให้สั้นกัน token เยอะ
-    context_snippet = context_text[:2000]
-
-    # นับคำที่ซ้ำกันแบบง่าย
-    common_terms = set(response_text.split()) & set(context_snippet.split())
-
-    if len(common_terms) >= 3:
-        return "from_context"
-    else:
-        return "ai_generated"
-
-def get_context_text(question: str, retriever) -> str:
-    """
-    ดึง context text จาก retriever โดยตรง
-    ใช้สำหรับ logging / QA เท่านั้น
-    """
-    try:
-        docs = retriever.get_relevant_documents(question)
-        return "\n\n".join(d.page_content for d in docs)
-    except Exception:
-        return ""
-
-def is_faq_question(question: str) -> bool:
-    faq_keywords = [
-        "ขั้นตอน", "จอง", "ยกเลิก", "มัดจำ", "เอกสาร",
-        "รับรถ", "คืนรถ", "ประกัน", "เงื่อนไข",
-        "ชำระเงิน", "ติดต่อ", "สาขา"
-    ]
-    return any(k in question for k in faq_keywords)
-
-# =====================
-# Streamlit Config
+# Streamlit Config & Session
 # =====================
 st.set_page_config(
-    page_title="SubaCar Bot",
-    page_icon="🚗",
+    page_title="INSURE Travel All in One",
+    page_icon="✈️",
     layout="centered"
 )
 
-st.title("SubaCar Bot – รถเช่าราคาดีที่สุดในไทย")
-st.caption("รถไฟฟ้า | ไฮบริด | SUV | Alphard | ถามเรื่องรถ หรือการจอง ยกเลิก ติดต่อ ก็ได้นะคะ 💬")
+st.title("INSURE Travel All in One – ประกันเดินทาง")
+st.caption("ค่ารักษาพยาบาล • กระเป๋าเดินทาง • ไฟลต์ดีเลย์ • ทรัพย์ในบ้านโจรกรรม | ถามได้เลยค่ะ ✈️")
 
-# =====================
-# Session State
-# =====================
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 if "total_tokens" not in st.session_state:
     st.session_state.total_tokens = 0
     st.session_state.total_cost = 0.0
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+# =====================
+# Helper Functions (เดิม)
+# =====================
+def safe_get_question(x):
+    q = x.get("question", "")
+    if isinstance(q, dict):
+        logger.warning("question เป็น dict → แปลงเป็น string: %s", q)
+        return str(q)
+    if isinstance(q, (list, tuple)):
+        return " ".join(str(item) for item in q)
+    return str(q) if q else ""
+
+def format_docs(docs):
+    if not docs:
+        logger.info("No relevant context retrieved")
+        return "ไม่มีข้อมูลที่เกี่ยวข้องในฐานข้อมูลค่ะ"
+    if isinstance(docs, dict):
+        logger.warning("docs เป็น dict แทน list: %s", docs)
+        return str(docs)
+    
+    formatted = "\n\n".join(
+        doc.page_content for doc in docs
+        if hasattr(doc, "page_content") and isinstance(doc.page_content, str)
+    )
+    logger.info(f"Retrieved context length: {len(formatted)} chars")
+    return formatted
+
+def extract_trip_slots(text: str) -> dict:
+    text = text.lower()
+    slots = {}
+    if re.search(r"\d+\s*วัน", text):
+        match = re.search(r"(\d+)\s*วัน", text)
+        if match:
+            slots["days"] = match.group(1)
+    if any(w in text for w in ["ยุโรป", "เชงเก้น", "ญี่ปุ่น", "เกาหลี", "จีน", "อเมริกา", "ออสเตรเลีย", "สิงคโปร์"]):
+        slots["destination"] = "ต่างประเทศ"
+    if re.search(r"\d+\s*คน", text):
+        match = re.search(r"(\d+)\s*คน", text)
+        if match:
+            slots["people"] = match.group(1)
+    return slots
 
 # =====================
-# Sidebar
-# =====================
-with st.sidebar:
-    st.header("สถิติการใช้ OpenAI (สะสม)")
-    st.write(f"Total Tokens: {st.session_state.total_tokens:,}")
-    st.write(f"ค่าใช้จ่ายประมาณ: ${st.session_state.total_cost:.6f}")
-
-    if st.button("ล้างประวัติการสนทนา"):
-        st.session_state.chat_history = []
-        st.success("ล้างประวัติเรียบร้อยแล้วค่ะ")
-
-# =====================
-# Load RAG Chain (เพิ่ม escalation_chain)
+# Load Components
 # =====================
 @st.cache_resource
-def load_rag_chain():
-    embedding = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3"
-    )
+def load_components():
+    embedding = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
 
-    vectorstore = Chroma(
-        persist_directory="chroma_db",
-        embedding_function=embedding,
-        collection_name="subacar_all"
-    )
+    base_dir = Path(__file__).resolve().parent
+    persist_dir = str(base_dir / "chroma_db_travel")
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    try:
+        vectorstore = Chroma(
+            persist_directory=persist_dir,
+            embedding_function=embedding,
+            collection_name="ta_all_in_one"
+        )
+        logger.info(f"โหลด Chroma DB สำเร็จ: {persist_dir}")
+    except Exception as e:
+        logger.error(f"โหลด Chroma ไม่ได้: {e}")
+        st.error("ไม่สามารถโหลดฐานข้อมูลได้ กรุณาตรวจสอบโฟลเดอร์ chroma_db_travel")
+        st.stop()
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.0
-    )
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
 
-    # --- Prompt เดิมทั้งหมด (ไม่เปลี่ยน) ---
-    template = """
-คุณคือพนักงาน SubaCar ที่น่ารัก เป็นกันเอง และเชี่ยวชาญด้านรถเช่า
-ตอบภาษาไทยเท่านั้น
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    llm_creative = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
 
-ใช้เฉพาะข้อมูลจากฐานข้อมูลด้านล่างนี้เท่านั้น
-ห้ามแต่งข้อมูลเพิ่ม ห้ามอนุมาน ห้ามคำนวณราคาเองเด็ดขาด
+    # BUSINESS_PROMPT (เดิม + ปรับให้ยืดหยุ่น)
+    BUSINESS_PROMPT = PromptTemplate.from_template("""
+คุณคือผู้ช่วยประกันเดินทาง Travel All in One ของ INSURE
+ตอบภาษาไทย สุภาพ กระชับ อ่านง่าย
 
-สำคัญมาก:
-ก่อนสรุปว่า "ไม่มีข้อมูล" ให้ตรวจสอบข้อมูลใน context อย่างละเอียด
-- พิจารณาคำพ้อง ความหมายใกล้เคียง และข้อมูลที่เกี่ยวข้องทางอ้อม
-- หาก context มีข้อมูลบางส่วนที่ตอบคำถามได้ ให้ตอบจากข้อมูลนั้น
-- ห้ามตอบว่าไม่มีข้อมูล หาก context มีข้อมูลที่เกี่ยวข้องแม้เพียงบางส่วน
-
-ให้ตอบว่า "ขอโทษค่ะ ข้อมูลนี้ยังไม่มีในระบบค่ะ"
-เฉพาะกรณีที่ context ไม่มีข้อมูลที่เกี่ยวข้องกับคำถามเลยจริง ๆ เท่านั้น
-
-รูปแบบคำตอบ:
-- ตอบสั้นมาก ใช้ bullet ไม่เกิน 5 ข้อ
-- ความยาวรวมไม่เกิน 450 ตัวอักษร
-- สามารถใช้อักษรย่อหรืออิโมจิที่ตรงกับข้อความได้
-- เรียงราคาจากถูก → แพง (ถ้าเป็นเรื่องรถหรือแพ็กเกจ)
-- หาก context มีราคาเพียง 1 ค่า หรือไม่สามารถเปรียบเทียบราคาได้ ให้แสดงราคาเท่าที่มี
-- บอกราคาชัดเจนตามระยะเช่าที่มีใน context เท่านั้น
-- บอกนโยบายยกเลิกทุกครั้ง (ถ้ามีข้อมูลใน context)
+กติกาสำคัญ:
+- ใช้เฉพาะข้อมูลจาก context เท่านั้น ห้ามแต่ง ห้ามเดา ห้ามอนุมาน
+- ห้ามรับประกันผลการเคลม หรือบอกว่าเคลมได้แน่นอน
+- ถ้าคำถามเกี่ยวกับ "จุดเด่น" "จุดเด่นของประกัน" "ข้อดี" "ดีตรงไหน" "สรุปจุดเด่น"  
+  ให้สรุปจากส่วนที่ขึ้นต้นด้วย "จุดเด่นของประกัน" ใน context ก่อนเป็นอันดับแรก ถ้าเจอให้ตอบตามนั้นเลย
+- ถ้าคำถามเป็น "แนะนำแผน" "ควรซื้อแผนไหน" "ไป [ประเทศ] ควรซื้อแผนอะไร" "ประกันไปญี่ปุ่น" หรือคำถามเชิงแนะนำ  
+  ให้สรุปความคุ้มครองหลักจาก context (เช่น แผนสูงสุดเหมาะต่างประเทศ) และถามกลับข้อมูลที่จำเป็น 1 ข้อ (เช่น กี่วัน, มีกิจกรรมเสี่ยงไหม)
+- ถ้าคำถามเกี่ยวกับ "ราคา" "เบี้ย" "เบี้ยประกัน" "ค่าใช้จ่าย" ให้ตอบตามตารางเบี้ยใน context โดยตรง (ระบุ Asia/Worldwide, ระยะเวลา, รวมอากรแสตมป์แล้ว)
+- ถ้า context ว่างหรือไม่เกี่ยวข้องจริง ๆ เท่านั้น ให้ตอบ "ขอโทษค่ะ ข้อมูลนี้ยังไม่มีในระบบค่ะ"
+- ความยาวไม่เกิน 650 ตัวอักษร
 
 ข้อมูลจากฐานข้อมูลจริง:
 {context}
@@ -270,185 +249,104 @@ def load_rag_chain():
 ประวัติการสนทนาก่อนหน้า:
 {chat_history}
 
-คำถามลูกค้า (ข้อความล่าสุด):
+คำถามผู้ใช้ล่าสุด:
 {question}
 
-แนวทางการตอบ (ทำตามลำดับ – เป็นกระบวนการภายใน):
-1) ประเมินประเภทคำถาม:
-- รุ่นรถ
-- ราคา
-- แพ็กเกจ
-- เปรียบเทียบหลายรุ่น
-- ภาพรวม / หาข้อมูล
-- สถานที่ / จังหวัด (Location-only input)
-- อื่น ๆ
-
-────────────────────────
-กรณี "สถานที่ / จังหวัด" เท่านั้น:
-- หากข้อความผู้ใช้เป็นเพียงชื่อจังหวัด / สถานที่
-- ไม่ถือว่าเป็นคำถามข้อมูล
-- ห้ามตอบว่า "ไม่มีข้อมูล"
-- ห้ามกล่าวถึงสาขา ความพร้อมให้บริการ หรือราคาในพื้นที่นั้น
-- ให้ตอบเชิงรับรู้ความสนใจ + เชื่อมโยงการใช้งานรถเช่าแบบกว้าง
-- ปิดท้ายด้วยคำถามใช้งาน 1 ข้อ (ตามกติกาด้านล่าง)
-────────────────────────
-
-2) รุ่นรถ:
-- ระบุประเภทรถที่พบ (Sedan / SUV / EV / Hybrid)
-- อธิบายลักษณะการใช้งานโดยรวม
-- ห้ามลงสเปกเชิงเทคนิค
-
-3) ราคา:
-- แสดงเฉพาะราคาที่พบใน context
-- หากมีหลายเงื่อนไข ให้แจ้งว่าเป็นราคาโดยประมาณ
-- หากไม่ชัดเจน ให้หลีกเลี่ยงตัวเลข
-
-4) แพ็กเกจ:
-- อธิบายประเภทแพ็กเกจ (รายวัน / รายสัปดาห์ / รายเดือน)
-- เน้นสิ่งที่รวมอยู่ในแพ็กเกจ
-
-5) เปรียบเทียบหลายรุ่น:
-- เปรียบเทียบเฉพาะรุ่น/ประเภทที่พบใน context
-- ไม่เกิน 3 รุ่น
-- เปรียบเทียบเชิงการใช้งาน
-- ห้ามตัดสินว่ารุ่นใดดีกว่า
-- หลีกเลี่ยงการเปรียบเทียบราคา หากข้อมูลไม่ครบ
-
-6) คำถามภาพรวม:
-- สรุปเป็นกลุ่มรถหรือประเภท
-- ยกตัวอย่างรุ่นที่พบ
-- ห้ามตอบว่าไม่มีข้อมูล
-
-7) ตอบว่า "ขอโทษค่ะ ข้อมูลนี้ยังไม่มีในระบบค่ะ"
-เฉพาะกรณีที่ context ไม่เกี่ยวข้องเลยจริง ๆ เท่านั้น
-
-หลังจากตอบข้อมูลหลักแล้ว:
-- สร้างคำถามปิดท้าย 1 ข้อ จาก:
-  • ระยะเวลาการใช้งาน
-  • ประเภทรถที่สนใจ
-  • ลักษณะการใช้งาน
-- ตรวจสอบ chat_history ก่อน ห้ามถามซ้ำ
-- ความยาวไม่เกิน 20–25 คำ
-- โทนผู้ช่วย เป็นมิตร ไม่ขาย
-
-จบคำตอบด้วยลิงก์นี้เสมอ:
-https://www.subacar.co.th/package
-
-ตอบเลย:"""  # (ใส่ template เดิมทั้งหมดของคุณที่นี่)
-    prompt = PromptTemplate.from_template(template)
-
-    faq_template = """
-คุณคือเจ้าหน้าที่ SubaCar ที่สุภาพ เป็นกันเอง น่ารัก และตอบคำถามลูกค้าอย่างชัดเจน
-ตอบภาษาไทยเท่านั้น ตอบสั้น กระชับ อ่านง่าย สบายตา
-
-ใช้เฉพาะข้อมูลจาก FAQ ใน context เท่านั้น
-ห้ามแต่งข้อมูล ห้ามเดา ห้ามอนุมาน หรือสรุปเกินที่มีใน FAQ เด็ดขาด
-
-สำคัญมาก:
-ก่อนบอกว่าไม่มีข้อมูล ให้ตรวจสอบ context อย่างละเอียด
-- พิจารณาคำพ้อง ความหมายใกล้เคียง และหัวข้อที่เกี่ยวข้อง
-- ถ้ามีข้อมูลบางส่วนที่ตอบได้ ให้ตอบจากข้อมูลนั้น
-- ห้ามบอกว่าไม่มีข้อมูล หาก context มีส่วนที่เกี่ยวข้องแม้เพียงเล็กน้อย
-
-หาก FAQ มีหลายหัวข้อที่เกี่ยวข้อง:
-- เลือกตอบเฉพาะหัวข้อที่ตรงกับคำถามมากที่สุด
-- ไม่รวมหลายหัวข้อมาปะปนในคำตอบเดียว
-- ไม่อธิบายข้อมูลที่ลูกค้าไม่ได้ถาม
-
-ให้ตอบว่า "ขอโทษค่ะ ข้อมูลนี้ยังไม่มีในระบบค่ะ"
-เฉพาะกรณีที่ context ไม่มีข้อมูลที่เกี่ยวข้องเลยจริง ๆ เท่านั้น
-
-รูปแบบคำตอบ (สำคัญ):
-- ใช้ภาษาง่าย สุภาพ เป็นมิตร
-- ความยาวรวมไม่เกิน 400 ตัวอักษร
-- ไม่ใส่ราคา เว้นแต่มีระบุชัดใน FAQ
-- ไม่ขาย ไม่ชวนเช่า ไม่เสนอโปรโมชัน
-- ไม่กล่าวถึงคำว่า “FAQ”, “ระบบ”, “ฐานข้อมูล” หรือแหล่งที่มาของข้อมูล
-
-โครงสร้างคำตอบ:
-- ไม่ต้องทักทายขึ้นต้น เช่น “สวัสดีค่ะ”
-- ไม่ต้องทวนคำถามลูกค้าซ้ำ
-- ตอบเข้าประเด็นทันที
-
-กรณีคำถามทั่วไป:
-- ตอบเป็นย่อหน้าเต็มประโยคสั้น ๆ หรือ bullet สั้น ๆ
-- อ่านลื่นไหล กระชับ
-
-กรณีคำถามเกี่ยวกับขั้นตอน วิธีการ กระบวนการ:
-- ตอบเป็นลำดับข้อชัดเจน
-- เริ่มด้วยประโยคเกริ่นสั้น ๆ 1 ประโยค
-- ใช้รูปแบบ:
-  1. ขั้นตอนแรก...
-  2. ขั้นตอนต่อไป...
-- ไม่เกิน 5 ข้อ
-- แต่ละข้อขึ้นบรรทัดใหม่
-
-ข้อมูลจาก FAQ จริง:
-{context}
-
-ประวัติการสนทนาก่อนหน้า:
-{chat_history}
-(ใช้เพื่อเข้าใจบริบทเท่านั้น ห้ามนำข้อมูลใหม่จาก chat_history มาตอบ)
-
-คำถามลูกค้า:
-{question}
-
-หลังจากตอบคำถามหลักแล้ว:
-- เพิ่มข้อความปิดท้าย 1 ประโยคสั้น ๆ เพื่อชวนถามต่ออย่างสุภาพ
-- ต้องเกี่ยวข้องกับหัวข้อคำถามล่าสุดเท่านั้น
-- ใช้โทนเป็นมิตร ไม่ขาย ไม่ขอข้อมูลส่วนตัว
-- ตัวอย่าง:
-  • มีส่วนไหนอยากทราบเพิ่มเติมไหมคะ
-  • อยากให้ช่วยอธิบายขั้นตอนไหนเพิ่มเติมคะ
-  • สอบถามเรื่องนี้เพิ่มได้เลยนะคะ
-
-จบคำตอบด้วยลิงก์นี้เสมอ:
-https://www.subacar.co.th/faq
+ถ้ามีลิงก์ซื้อออนไลน์ ให้แสดงท้ายสุด:
+"ซื้อออนไลน์ได้ที่: {buy_link}"
 
 ตอบเลย:
-"""  # (ใส่ faq_template เดิมทั้งหมดของคุณที่นี่)
-    faq_prompt = PromptTemplate.from_template(faq_template)
+""")
 
-    chain = (
-        {
-            "context": (
-                RunnableLambda(lambda x: x["question"])
-                | retriever
-                | RunnableLambda(lambda docs: "\n\n".join(d.page_content for d in docs))
-            ),
-            "question": RunnableLambda(lambda x: x["question"]),
-            "chat_history": RunnableLambda(lambda x: x["chat_history"]),
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    # RECOMMEND_PROMPT (เดิม + ปรับให้ถามต่อเนื่อง)
+    RECOMMEND_PROMPT = PromptTemplate.from_template("""
+คุณคือผู้ช่วยแนะนำแผนประกันเดินทาง
+ตอบภาษาไทย กระชับ ช่วยตัดสินใจ
 
-    faq_chain = (
-        {
-            "context": (
-                RunnableLambda(lambda x: x["question"])
-                | retriever
-                | RunnableLambda(lambda docs: "\n\n".join(d.page_content for d in docs))
-            ),
-            "question": RunnableLambda(lambda x: x["question"]),
-            "chat_history": RunnableLambda(lambda x: x["chat_history"]),
-        }
-        | faq_prompt
-        | llm
-        | StrOutputParser()
-    )
+กติกา:
+- ใช้ข้อมูลจาก context และ recommended_plans_json เท่านั้น ห้ามแต่งจุดเด่น
+- ห้ามรับประกันเคลมหรือการันตี
+- ถ้าข้อมูลทริปไม่ครบ ให้ถามกลับเฉพาะข้อสำคัญ 1 ข้อ (เช่น กี่วัน, ปลายทางแน่นอนไหม)
+- ให้เหตุผลตาม trip_slots และ context
+- ถ้ามีข้อมูลเบี้ยใน context ให้ระบุเบี้ยโดยประมาณตามแผนและระยะเวลา (รวมอากรแสตมป์)
 
-    # --- เพิ่ม Escalation Chain ใหม่ ---
+ข้อมูลทริป:
+{trip_slots}
+
+แผนแนะนำ:
+{recommended_plans_json}
+
+ข้อมูลจากฐาน:
+{context}
+
+ประวัติการคุย:
+{chat_history}
+
+คำถาม:
+{question}
+
+รูปแบบ:
+- bullet
+- แต่ละแผน: ชื่อ • เหมาะกับ • จุดเด่นหลัก 1-2 ข้อ • เบี้ยประมาณ (ถ้ามี)
+- ปิดด้วยคำถามสุภาพ เช่น "สนใจแผนไหนเป็นพิเศษไหมคะ" หรือ "เดินทางกี่วันคะ?"
+
+ตอบเลย:
+""")
+
+    # Escalation Chain
     escalation_prompt = PromptTemplate.from_template(fallback_escalation_template)
     escalation_chain = escalation_prompt | llm | StrOutputParser()
 
-    return chain, faq_chain, retriever, escalation_chain
+    business_chain = (
+        {
+            "context": RunnableLambda(safe_get_question) | retriever | RunnableLambda(format_docs),
+            "question": RunnableLambda(safe_get_question),
+            "chat_history": lambda x: x.get("chat_history", ""),
+            "buy_link": lambda x: x.get("buy_link", "https://www.indara.co.th/products/travel-insurance/ta-allinone")
+        }
+        | BUSINESS_PROMPT
+        | llm
+        | StrOutputParser()
+    )
 
-with st.spinner("กำลังโหลดฐานข้อมูลรถและ FAQ..."):
-    chain, faq_chain, retriever, escalation_chain = load_rag_chain()
+    recommend_chain = (
+        {
+            "trip_slots": lambda x: x["trip_slots"],
+            "recommended_plans_json": lambda x: x["recommended_plans_json"],
+            "context": RunnableLambda(safe_get_question) | retriever | RunnableLambda(format_docs),
+            "chat_history": lambda x: x.get("chat_history", ""),
+            "question": RunnableLambda(safe_get_question)
+        }
+        | RECOMMEND_PROMPT
+        | llm_creative
+        | StrOutputParser()
+    )
 
-st.success("พร้อมแล้วค่ะ 😊")
+    return business_chain, recommend_chain, retriever, escalation_chain
+
+# โหลด
+with st.spinner("กำลังโหลดฐานข้อมูล..."):
+    business_chain, recommend_chain, retriever, escalation_chain = load_components()
+st.success("พร้อมใช้งานแล้วค่ะ ✈️")
+
+# Logic แนะนำแผนเบื้องต้น
+def simple_recommend(trip_slots: dict):
+    if not trip_slots or "destination" not in trip_slots:
+        return {
+            "recommended_plans": [],
+            "missing_slots": ["destination"],
+            "next_question": "ไปเที่ยวประเทศไหนคะ?"
+        }
+
+    plans = [
+        {"plan_id": "plan3", "label": "แผน 3", "reason": "คุ้มครองครบ เหมาะทริปทั่วไป"},
+        {"plan_id": "plan5", "label": "แผน 5", "reason": "วงเงินสูงสุด เหมาะทริปต่างประเทศ"}
+    ]
+    return {
+        "recommended_plans": plans,
+        "missing_slots": [],
+        "next_question": ""
+    }
 
 # =====================
 # Chat UI
@@ -457,72 +355,74 @@ for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if user_input := st.chat_input("อยากเช่ารถแบบไหน หรือมีคำถามอะไรคะ?"):
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    st.session_state.chat_history.append({
-        "role": "user",
-        "content": user_input
-    })
+if user_input := st.chat_input("ถามเรื่องประกันเดินทางได้เลยค่ะ ✈️"):
+    st.chat_message("user").markdown(user_input)
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
 
     with st.chat_message("assistant"):
-        with st.spinner("กำลังหาคำตอบให้..."):
-            start_time = time.time()
-            try:
-                # --- ตรวจจับ abuse ก่อน ---
-                abuse_level = classify_abuse_level(user_input)
+        with st.spinner("กำลังตอบ..."):
+            start = time.time()
 
+            try:
+                history = "\n".join(
+                    f"{m['role']}: {m['content']}"
+                    for m in st.session_state.chat_history[-8:]
+                )
+
+                # === ตรวจจับ abuse ก่อน ===
+                abuse_level = classify_abuse_level(user_input)
                 if abuse_level != "NONE":
-                    logger.info(f"Detected inappropriate message - Level: {abuse_level}")
-                    
+                    logger.info(f"Detected abuse - Level: {abuse_level} | Message: {user_input}")
                     response = escalation_chain.invoke({
                         "level": abuse_level,
                         "question": user_input
                     })
-                    
-                    # ไม่นับ token/cost และไม่ดึง context
+                    mode = f"ESCALATION_{abuse_level}"
                 else:
-                    # --- การทำงานเดิมทั้งหมด ---
+                    # === ปกติ ===
+                    recommend_keywords = ["แนะนำ", "ควรซื้อ", "แผนไหน", "เหมาะกับ", "ไป", "เที่ยว", "ญี่ปุ่น", "เกาหลี", "ยุโรป", "ต่างประเทศ"]
+                    is_recommend = any(kw in user_input.lower() for kw in recommend_keywords)
+
+                    trip_slots = extract_trip_slots(user_input)
+                    recommend_info = simple_recommend(trip_slots)
+
                     with get_openai_callback() as cb:
-                        history_text = "\n".join(
-                            f"{m['role']}: {m['content']}"
-                            for m in st.session_state.chat_history[-6:]
-                        )
-                        input_payload = {
-                            "question": user_input,
-                            "chat_history": history_text
-                        }
-
-                        if is_faq_question(user_input):
-                            response = faq_chain.invoke(input_payload)
-                            logger.info("Using FAQ prompt")
+                        if is_recommend or recommend_info["recommended_plans"]:
+                            logger.info("Using RECOMMEND prompt")
+                            mode = "RECOMMEND"
+                            response = recommend_chain.invoke({
+                                "trip_slots": json.dumps(trip_slots, ensure_ascii=False),
+                                "recommended_plans_json": json.dumps(recommend_info["recommended_plans"], ensure_ascii=False),
+                                "chat_history": history,
+                                "question": user_input
+                            })
                         else:
-                            response = chain.invoke(input_payload)
-                            logger.info("Using RENTAL prompt")
+                            logger.info("Using BUSINESS prompt")
+                            mode = "BUSINESS"
+                            response = business_chain.invoke({
+                                "question": user_input,
+                                "chat_history": history,
+                                "buy_link": "https://www.indara.co.th/products/travel-insurance/ta-allinone"
+                            })
 
-                        context_text = get_context_text(user_input, retriever)
-                        answer_source = detect_answer_source(response, context_text)
-                        logger.info(f"Answer source check: {answer_source}")
-
+                        logger.info(f"Completed | Mode: {mode} | Tokens: {cb.total_tokens} | Cost: ${cb.total_cost:.6f}")
                         st.session_state.total_tokens += cb.total_tokens
                         st.session_state.total_cost += cb.total_cost
 
-                        logger.info(
-                            f"Success | {time.time() - start_time:.2f}s | Tokens: {cb.total_tokens} | Cost: ${cb.total_cost:.6f}"
-                        )
-
-                end_time = time.time()
-                elapsed_time = end_time - start_time
-
-                st.session_state.chat_history.append({
-                    "role": "assistant",
-                    "content": response
-                })
-
                 st.markdown(response)
-                st.caption(f"⏱️ ใช้เวลาตอบ {elapsed_time:.2f} วินาที")
+                st.caption(f"ใช้เวลา {time.time() - start:.2f} วินาที | Mode: {mode}")
+
+                st.session_state.chat_history.append({"role": "assistant", "content": response})
 
             except Exception as e:
-                logger.error(str(e))
-                st.error("ขอโทษค่ะ เกิดข้อผิดพลาด ลองถามใหม่อีกครั้งนะคะ")
+                logger.exception("Error")
+                st.error(f"เกิดข้อผิดพลาด: {str(e)}\nกรุณาลองใหม่อีกครั้งนะคะ")
+
+# Sidebar
+with st.sidebar:
+    st.header("ข้อมูลการใช้งาน")
+    st.write(f"Tokens: {st.session_state.total_tokens:,}")
+    st.write(f"Cost ≈ ${st.session_state.total_cost:.6f}")
+    if st.button("ล้างประวัติ"):
+        st.session_state.chat_history = []
+        st.rerun()
