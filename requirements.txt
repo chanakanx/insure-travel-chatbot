@@ -10,3 +10,4 @@ huggingface-hub
 python-dotenv
 openai
 tiktoken
+sentence-transformers  # เพิ่มบรรทัดนี้เพื่อรองรับ BAAI/bge-m3
