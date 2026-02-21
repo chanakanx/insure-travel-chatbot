@@ -11,6 +11,7 @@ import time
 import logging
 import json
 import re
+import torch
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -113,7 +114,11 @@ def simple_recommend(trip_slots: dict):
 # =====================
 @st.cache_resource
 def load_components():
-    embedding = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+    embedding = HuggingFaceEmbeddings(
+    model_name="intfloat/multilingual-e5-small",
+    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+    encode_kwargs={"normalize_embeddings": True}   # แนะนำเปิดสำหรับ E5 series
+)
     persist_dir = str(Path(__file__).resolve().parent / "chroma_db_travel")
 
     try:
