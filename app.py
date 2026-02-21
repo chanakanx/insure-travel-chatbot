@@ -133,7 +133,7 @@ def load_components():
         st.error("ไม่สามารถโหลดฐานข้อมูลได้ กรุณารัน reset_and_ingest.py ก่อน")
         st.stop()
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
 
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
     llm_creative = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
